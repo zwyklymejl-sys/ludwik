@@ -1,0 +1,98 @@
+import math
+
+import numpy as np
+
+from .. import common
+from ..common import MethodResult, PatternRow, RowBlock, TableBlock
+
+CODE = "M1"
+NAME = "Method 1 - paid to ultimate"
+
+
+def run(data, settings):
+    s = settings.method1
+    n_acc, n_dev = data.n_accident, data.n_development
+
+    paid = data.paid
+    best_estimate_latest = np.nan_to_num(data.latest_diagonal(data.best_estimate))
+    paid_latest = np.nan_to_num(data.latest_diagonal(paid))
+    ultimate = paid_latest + best_estimate_latest
+
+    safe_ultimate = np.where(ultimate != 0, ultimate, np.nan)
+    ratio = paid / safe_ultimate[:, None]
+    ratio = np.where(np.isnan(paid), np.nan, np.nan_to_num(ratio))     # observed cell with U = 0 -> 0
+
+    simple_avg = np.full(n_dev, np.nan)
+    weighted_avg = np.full(n_dev, np.nan)
+    for k in range(n_dev):
+        observed = np.flatnonzero(~np.isnan(ratio[:, k]))
+        if len(observed) == 0:
+            continue
+        simple_avg[k] = ratio[observed, k].mean()
+        window = observed[-s.window:]
+        weights = best_estimate_latest[window]
+        if weights.sum() > 0:
+            weighted_avg[k] = (weights * ratio[window, k]).sum() / weights.sum()
+        else:
+            weighted_avg[k] = 1.0
+    n_data = int(np.flatnonzero(~np.isnan(weighted_avg)).max()) + 1  # tenors with data
+
+
+    x0, flags = common.leading_non_descending_run(weighted_avg[:n_data])
+    y0 = weighted_avg[x0 - 1] if x0 > 0 else None
+
+    rule_n, oldest_open = common.end_tenor_rule(data, best_estimate_latest, s.open_threshold)
+    end_tenor = s.end_tenor_override or rule_n
+
+    fit_tenors = np.arange(2, n_data + 1)
+    fit_values = weighted_avg[1:n_data]
+    if x0 > 0:
+        case = "curve through (x0, y0) and (N, 100%)"
+        a, b = common.log_curve_through_points(x0, y0, end_tenor, log=math.log10)
+    else:
+        case = "tenor 1 > 100%: least squares on t = 2..n, 100% at N"
+        u = np.log10(fit_tenors) - math.log10(end_tenor)
+        a = float((u * (fit_values - 1)).sum() / (u * u).sum()) if (u * u).sum() > 0 else 0.0
+        b = 1 - a * math.log10(end_tenor)
+    rss = float(((a * np.log10(fit_tenors) + b - fit_values) ** 2).sum())
+
+    n_tenors = max(n_data + 1, end_tenor)
+    pattern = np.ones(n_tenors)
+    for t in range(1, n_tenors + 1):
+        if t <= x0:
+            pattern[t - 1] = weighted_avg[t - 1]
+        elif t >= end_tenor or a <= 0:
+            pattern[t - 1] = 1.0
+        else:
+            pattern[t - 1] = a * math.log10(t) + b
+
+    tenors = list(range(1, n_tenors + 1))
+    blocks = [
+        TableBlock("payment triangle (cumulative paid):", data.accident_labels, list(range(n_dev)), paid,
+                   "number", is_input=True,
+                   side_columns=[("ultimate", ultimate, "number"), ("BE (rbns+ibnr)", best_estimate_latest, "number")]),
+        TableBlock("run-off triangle (paid / ultimate):", data.accident_labels, list(range(n_dev)), ratio, "percent"),
+        RowBlock("run-off:", tenors, [
+            PatternRow("average", common.pad_to(simple_avg[:n_data], n_tenors)),
+            PatternRow(f"weighted avg (BE, last {s.window} diag.)", common.pad_to(weighted_avg[:n_data], n_tenors)),
+            PatternRow("non-descending & <=100% flag", common.pad_to(flags.astype(float), n_tenors), "integer"),
+            PatternRow("final pattern (copy this row)", pattern, highlight=True),
+            PatternRow("implied one-year payout", common.implied_payout_rates(pattern), "percent1"),
+        ]),
+    ]
+    parameters = [
+        ("window (latest diagonals)", s.window, "integer"),
+        ("x0 = last non-descending tenor (<=100%)", x0, "integer"),
+        ("y0 = weighted value at x0", y0 if y0 is not None else "n/a", "percent"),
+        ("case", case, "text"),
+        ("latest accident period", data.accident_labels[-1], "text"),
+        ("oldest accident period with BE > threshold", oldest_open, "text"),
+        ("N by rule = (latest + 1 - oldest open) + 2", rule_n, "integer"),
+        ("N used", end_tenor, "integer"),
+        ("A  (y = A*log10(t) + B)", a, "decimal"),
+        ("B", b, "decimal"),
+        ("RSS on t = 2..n", rss, "decimal"),
+    ]
+    return MethodResult(CODE, NAME, data.name,
+                        "BE-weighted paid/ultimate, anchor at the last non-descending tenor, log10 tail to 100% at N.",
+                        pattern, blocks, parameters)
