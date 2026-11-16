@@ -1,0 +1,36 @@
+import sys
+import numpy as np
+import pandas as pd
+
+
+def main(inp, out):
+    d = pd.read_excel(inp, usecols=["victim_id", "AY", "AQ", "report_id"])
+    d[["AY", "AQ", "report_id"]] = d[["AY", "AQ", "report_id"]].astype(int)
+    d = d.sort_values("report_id").drop_duplicates(["victim_id", "AY", "AQ"])
+    d["acc"] = d.AY * 4 + d.AQ // 3 - 1
+    d["rep"] = d.report_id // 100 * 4 + (d.report_id % 100 - 1) // 3
+    d["delay"] = (d.rep - d.acc) * 3
+
+    grouped = (d.groupby(["AY", "AQ", "report_id", "delay"]).size()
+                .rename("count").reset_index())
+
+    acc = range(d.acc.min(), d.acc.max() + 1)
+    val = d.rep.max()
+    delays = range(0, (val - d.acc.min() + 1) * 3, 3)
+    incr = d.pivot_table(index="acc", columns="delay", aggfunc="size").reindex(
+        index=acc, columns=delays, fill_value=0).fillna(0)
+    future = np.add.outer(np.array(acc), np.array(delays) // 3) > val
+    cum = incr.cumsum(axis=1).mask(future)
+    incr = incr.mask(future)
+    for t in (cum, incr):
+        t.index = [f"{a // 4}Q{a % 4 + 1}" for a in acc]
+        t.columns.name = None
+
+    with pd.ExcelWriter(out) as xw:
+        grouped.to_excel(xw, sheet_name="grouped", index=False)
+        cum.to_excel(xw, sheet_name="cumulative")
+        incr.to_excel(xw, sheet_name="incremental")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])
