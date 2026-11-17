@@ -1,0 +1,60 @@
+import sys
+import numpy as np
+import pandas as pd
+
+
+def main(inp, out):
+    cols = ["VICTIM", "REPORT_ID", "AY", "AQ", "STATUS"]
+    d = pd.read_excel(inp, usecols=cols)
+    d[cols[1:4]] = d[cols[1:4]].astype(int)
+    d["STATUS"] = d.STATUS.astype(float).round(6)
+    d["acc"] = d.AY * 4 + d.AQ // 3 - 1
+    d["rep"] = d.REPORT_ID // 100 * 4 + (d.REPORT_ID % 100 - 1) // 3
+    rep_id = d.groupby("rep").REPORT_ID.max()
+    key = ["VICTIM", "AY", "AQ"]
+    d = (d.groupby(key + ["acc", "rep"], as_index=False).STATUS.max()
+          .sort_values(key + ["rep"]))
+
+    reps = np.sort(d.rep.unique())
+    g = d.groupby(key)
+    d["paid"] = (d.STATUS > 102).astype(int)
+    d["paid"] = g.paid.cummax()
+    d["next_snap"] = d.rep.map(dict(zip(reps[:-1], reps[1:])))
+    d["next_row"] = g.rep.shift(-1)
+
+    first = g.cumcount() == 0
+    reopened = (g.paid.shift() == 0) & (g.next_snap.shift() != d.rep)
+    closed = (d.paid == 0) & d.next_snap.notna() & (d.next_row != d.next_snap)
+
+    ev = pd.concat([
+        d[first | reopened].assign(reported=1, closed_unpaid=0),
+        d[closed].assign(rep=lambda x: x.next_snap.astype(int), reported=0, closed_unpaid=1),
+    ])
+    ev = ev[ev.rep >= ev.acc]
+    ev["delay"] = (ev.rep - ev.acc) * 3
+    ev["REPORT_ID"] = ev.rep.map(rep_id)
+    ev["net"] = ev.reported - ev.closed_unpaid
+
+    grouped = (ev.groupby(["AY", "AQ", "REPORT_ID", "delay"])[["reported", "closed_unpaid", "net"]]
+                 .sum().reset_index())
+
+    acc = range(d.acc.min(), d.acc.max() + 1)
+    val = reps.max()
+    delays = range(0, (val - d.acc.min() + 1) * 3, 3)
+    incr = ev.pivot_table(index="acc", columns="delay", values="net", aggfunc="sum").reindex(
+        index=acc, columns=delays, fill_value=0).fillna(0)
+    future = np.add.outer(np.array(acc), np.array(delays) // 3) > val
+    cum = incr.cumsum(axis=1).mask(future)
+    incr = incr.mask(future)
+    for t in (cum, incr):
+        t.index = [f"{a // 4}Q{a % 4 + 1}" for a in acc]
+        t.columns.name = None
+
+    with pd.ExcelWriter(out) as xw:
+        grouped.to_excel(xw, sheet_name="grouped", index=False)
+        cum.to_excel(xw, sheet_name="cumulative")
+        incr.to_excel(xw, sheet_name="incremental")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])
